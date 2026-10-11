@@ -1,0 +1,90 @@
+# 上游只发布 x86_64 Linux 包, 在 linux/arm64 上无法运行.
+# 本 workflow 用同一份源码重建 arm64 包, 产物挂在 tag `amane-*` 的 release 上 (Amane 按此 URL 下载).
+# 源码 = 上游 v0.2.0 (= master 37026f4), 与官方 ubuntu 包同源; 模型取自官方包 (SHA256 固定).
+name: amane arm64
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "amane-*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    # glibc 2.35: 覆盖 Debian 12 / Ubuntu 22.04 及以上
+    container: ubuntu:22.04
+    env:
+      NAME: realesrgan-ncnn-vulkan-20220424-ubuntu-arm64
+      UPSTREAM_ZIP: https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip
+      UPSTREAM_SHA256: e5aa6eb131234b87c0c51f82b89390f5e3e642b7b70f2b9bbe95b6a285a40c96
+    steps:
+      - name: 安装构建依赖
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates cmake curl g++ git glslang-tools libgomp1 libvulkan-dev libvulkan1 \
+            make python3 unzip zip
+
+      # .gitmodules 使用 git@github.com: 地址, 容器内无 SSH 凭据, 改写为 https
+      - name: 允许以 https 拉取子模块
+        run: git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: 编译
+        run: |
+          cmake -S src -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      - name: 取上游模型与测试图
+        run: |
+          curl -fsSL -o upstream.zip "$UPSTREAM_ZIP"
+          echo "$UPSTREAM_SHA256  upstream.zip" | sha256sum -c -
+          unzip -q upstream.zip models/* input.jpg
+
+      - name: 打包
+        run: |
+          mkdir -p "pkg/$NAME"
+          cp README.md LICENSE "pkg/$NAME/"
+          cp build/realesrgan-ncnn-vulkan "pkg/$NAME/"
+          strip -g "pkg/$NAME/realesrgan-ncnn-vulkan"
+          cp -r models "pkg/$NAME/"
+          (cd pkg && zip -9 -r "$NAME.zip" "$NAME")
+          unzip -l "pkg/$NAME.zip"
+
+      - name: 冒烟测试 (无 Vulkan 设备, 回退 CPU)
+        shell: bash
+        run: |
+          cd "pkg/$NAME"
+          time ./realesrgan-ncnn-vulkan \
+            -i "$GITHUB_WORKSPACE/input.jpg" -o "$GITHUB_WORKSPACE/smoke.jpg" \
+            -n realesrgan-x4plus -s 4 -f jpg
+          ls -l "$GITHUB_WORKSPACE/smoke.jpg"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.NAME }}
+          path: pkg/${{ env.NAME }}.zip
+          if-no-files-found: error
+
+      - uses: softprops/action-gh-release@v3
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: pkg/${{ env.NAME }}.zip
+          name: linux/arm64 制品 (${{ github.ref_name }})
+          prerelease: true
+          fail_on_unmatched_files: true
+          body: |
+            上游 x86_64 Linux 包在 linux/arm64 上无法运行, 这里提供同一份源码的 arm64 重编译包.
+
+            - 源码: `xinntao/Real-ESRGAN-ncnn-vulkan` tag `v0.2.0` (`37026f4`, 与 master 一致)
+            - 模型: 取自官方 `v0.2.5.0` 的 ubuntu 包, SHA256 `e5aa6eb1…`
+            - 构建: GitHub `ubuntu-24.04-arm` runner, `ubuntu:22.04` 容器 (glibc 2.35)
+            - 运行期依赖: `libgomp1` 与 `libvulkan1` (无 Vulkan 设备时回退 CPU)
+            - 内容: `realesrgan-ncnn-vulkan` 与 `models/`
